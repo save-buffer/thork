@@ -42,7 +42,8 @@ out = A + B
 
 A CUDA kernel to do the same:
 ```cuda
-extern "C" __global__ void matrix_add(float *out, const float *A, const float *B) {
+extern "C" __global__ void matrix_add(float *out, const float *A, const float *B)
+{
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     out[i] = A[i] + B[i];
 }
