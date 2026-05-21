@@ -1,0 +1,49 @@
+[project]
+name = "thork"
+version = "0.1.0"
+description = "A tracing Python DSL for writing CUDA C++ compute kernels for NVIDIA GPUs."
+readme = "README.md"
+authors = [
+    { name = "Sasha Krassovsky", email = "krassovskysasha@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "cuda-python>=12.0",
+]
+keywords = [
+    "cuda",
+    "nvidia",
+    "gpu",
+    "kernel",
+    "dsl",
+    "tracing",
+    "compute",
+    "machine-learning",
+    "thunderkittens",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "thork"
