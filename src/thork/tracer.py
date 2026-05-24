@@ -61,6 +61,18 @@ class KernelBuilder:
             ("cuda_fp16.h", True),
             ("cuda_bf16.h", True),
         ]
+        # Set by ThunderKittens wrappers when a kernel needs the TK header
+        # tree (which pulls in libstdc++ headers that nvrtc can't reach —
+        # the runtime routes such kernels through nvcc instead).
+        self.uses_kittens : bool = False
+        # Set by TMA wrappers; flips the shared-memory allocator emitted
+        # in the kernel preamble from ``shared_allocator`` to
+        # ``tma_swizzle_allocator`` (which respects TMA swizzle alignment).
+        self.uses_tma : bool = False
+        # Extra kernel-signature parameters that aren't bound from Python
+        # (e.g. TK gl<> globals constructed by the runtime, see kittens.py).
+        # Each entry is a free-form CUDA parameter declaration string.
+        self.extra_param_decls : List[str] = []
         self.usings : List[str] = []
         self.device_functions : List["DeviceFn"] = []
         self._dfn_names : set = set()

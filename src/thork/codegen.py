@@ -130,7 +130,9 @@ def format_stmt(stmt : ir.Stmt, indent : int = 4) -> Tuple[str, Dict[int, tuple]
         return f"{pad}{stmt.cuda_type} {stmt.name};", locs
     if isinstance(stmt, ir.ConstructorDecl):
         args = ", ".join(format_expr(a, 0) for a in stmt.args)
-        return f"{pad}{stmt.cuda_type} {stmt.name}({args});", locs
+        if stmt.args:
+            return f"{pad}{stmt.cuda_type} {stmt.name}({args});", locs
+        return f"{pad}{stmt.cuda_type} {stmt.name}{{}};", locs
     if isinstance(stmt, ir.Break):
         return f"{pad}break;", locs
     if isinstance(stmt, ir.Continue):
@@ -226,9 +228,61 @@ def emit_device_fn(df) -> Tuple[str, Dict[int, tuple]]:
     return text, locs
 
 
+_TK_CUDA_TYPE = {
+    "float32"  : "float",
+    "float16"  : "kittens::half",
+    "bfloat16" : "kittens::bf16",
+    "int32"    : "int",
+    "uint32"   : "unsigned int",
+}
+
+
+def _tk_elem_type(d) -> str:
+    """
+    Map a thork dtype name to the type spelling that goes inside
+    ``kittens::gl<...>`` / ``kittens::st_*`` / ``kittens::rt_*``.
+    """
+    if d.name not in _TK_CUDA_TYPE:
+        raise TypeError(f"thork dtype {d.name} has no ThunderKittens equivalent")
+    return _TK_CUDA_TYPE[d.name]
+
+
+def _tk_st_type(d, tile_rows : int, tile_cols : int) -> str:
+    """
+    Pick the kittens::st_* alias matching a thork dtype, for use as a TMA
+    tile parameter inside ``gl<...>``.
+    """
+    aliases = {
+        "bfloat16" : "st_bf",
+        "float16"  : "st_hf",
+        "float32"  : "st_fl",
+    }
+    if d.name not in aliases:
+        raise TypeError(
+            f"No kittens::st_* alias for dtype {d.name}; cannot use it as a "
+            "TMA tile type"
+        )
+    return f"kittens::{aliases[d.name]}<{tile_rows}, {tile_cols}>"
+
+
+def _gl_template(p : ir.Param) -> str:
+    """
+    Render the ``kittens::gl<...>`` template instantiation for a
+    kittens_global parameter. When ``p.tile_shape`` is set, includes the
+    matching shared-tile TMA type.
+    """
+    elem = _tk_elem_type(p.dtype)
+    tile = getattr(p, "tile_shape", None)
+    if tile is not None:
+        st = _tk_st_type(p.dtype, tile[0], tile[1])
+        return f"kittens::gl<{elem}, 1, 1, -1, -1, {st}>"
+    return f"kittens::gl<{elem}, 1, 1, -1, -1>"
+
+
 def _format_kernel_param(p : ir.Param) -> str:
     """
-    Render a single pointer/constant kernel parameter declaration.
+    Render a single pointer/constant/kittens-global kernel parameter
+    declaration.
 
     Attribute params are NOT rendered here — they become local declarations
     at the top of the kernel body, since CUDA doesn't pass them as args.
@@ -237,6 +291,8 @@ def _format_kernel_param(p : ir.Param) -> str:
         return f"    {p.dtype.cuda} *{p.name}"
     if p.kind == "constant":
         return f"    {p.cuda_name or p.dtype.cuda} {p.name}"
+    if p.kind == "kittens_global":
+        return f"    const __grid_constant__ {p.name}_gl_t {p.name}"
     raise ValueError(f"Param kind {p.kind!r} is not a kernel argument")
 
 
@@ -300,8 +356,16 @@ def emit_kernel(builder : KernelBuilder) -> Tuple[str, SourceMap]:
         add_block(df_text, df_locs)
         add_line("")
 
-    bindable_params = [p for p in builder.params if p.kind in ("pointer", "constant")]
+    bindable_params = [
+        p for p in builder.params if p.kind in ("pointer", "constant", "kittens_global")
+    ]
     attribute_params = [p for p in builder.params if p.kind == "attribute"]
+
+    for p in bindable_params:
+        if p.kind == "kittens_global":
+            add_line(f"using {p.name}_gl_t = {_gl_template(p)};")
+    if any(p.kind == "kittens_global" for p in bindable_params):
+        add_line("")
 
     param_lines = [_format_kernel_param(p) for p in bindable_params]
 
@@ -318,6 +382,14 @@ def emit_kernel(builder : KernelBuilder) -> Tuple[str, SourceMap]:
         decl_type = p.cuda_name if p.vec_size > 1 else p.dtype.cuda
         add_line(f"    {decl_type} {p.name} = {_attribute_init_text(p)};")
 
+    if getattr(builder, "uses_kittens", False):
+        if getattr(builder, "uses_tma", False):
+            add_line("    extern __shared__ int __thork_shm[];")
+            add_line("    kittens::tma_swizzle_allocator __thork_smem_al((int*)&__thork_shm[0]);")
+        else:
+            add_line("    extern __shared__ kittens::alignment_dummy __thork_shm[];")
+            add_line("    kittens::shared_allocator __thork_smem_al((int*)&__thork_shm[0]);")
+
     body_text, body_locs = format_stmts(builder.stmts, indent=4)
     if body_text:
         add_block(body_text, body_locs)
@@ -326,5 +398,72 @@ def emit_kernel(builder : KernelBuilder) -> Tuple[str, SourceMap]:
 
     add_line("}")
 
+    if getattr(builder, "uses_kittens", False):
+        add_line("")
+        add_block(_emit_host_launcher(builder.name, bindable_params), {})
+
     source = "\n".join(lines) + "\n"
     return source, source_map
+
+
+def _scalar_c_type(p : ir.Param) -> str:
+    """
+    C type to use for a constant scalar param in the host launcher signature.
+    """
+    return p.cuda_name if p.cuda_name and p.cuda_name not in ("uint", "int") else p.dtype.cuda
+
+
+def _emit_host_launcher(name : str, bindable_params : List[ir.Param]) -> str:
+    """
+    Render an ``extern "C" void thork_launch_<name>(...)`` host function
+    that constructs ``kittens::gl`` objects from raw (ptr, rows, cols)
+    triples and invokes the kernel via the standard ``<<<grid, block,
+    smem, stream>>>`` runtime launch.
+    """
+    params : List[str] = [
+        "unsigned grid_x", "unsigned grid_y", "unsigned grid_z",
+        "unsigned block_x", "unsigned block_y", "unsigned block_z",
+        "unsigned smem_bytes",
+        "void *stream",
+    ]
+    call_args : List[str] = []
+    pre_stmts : List[str] = []
+
+    for p in bindable_params:
+        if p.kind == "pointer":
+            params.append(f"void *{p.name}_ptr")
+            call_args.append(f"({p.dtype.cuda} *){p.name}_ptr")
+        elif p.kind == "constant":
+            params.append(f"{_scalar_c_type(p)} {p.name}")
+            call_args.append(p.name)
+        elif p.kind == "kittens_global":
+            params.append(f"void *{p.name}_ptr")
+            params.append(f"size_t {p.name}_rows")
+            params.append(f"size_t {p.name}_cols")
+            elem = _tk_elem_type(p.dtype)
+            pre_stmts.append(
+                f"    {p.name}_gl_t {p.name}{{"
+                f"({elem} *){p.name}_ptr, nullptr, nullptr, "
+                f"{p.name}_rows, {p.name}_cols}};"
+            )
+            call_args.append(p.name)
+
+    sig = ", ".join(params)
+    call_args_s = ", ".join(call_args)
+    lines : List[str] = []
+    lines.append(f'extern "C" void thork_launch_{name}({sig})')
+    lines.append("{")
+    if pre_stmts:
+        lines.extend(pre_stmts)
+    lines.append(
+        f"    cudaFuncSetAttribute({name}, "
+        "cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);"
+    )
+    lines.append("    dim3 grid(grid_x, grid_y, grid_z);")
+    lines.append("    dim3 block(block_x, block_y, block_z);")
+    lines.append(
+        f"    {name}<<<grid, block, smem_bytes, (cudaStream_t)stream>>>"
+        f"({call_args_s});"
+    )
+    lines.append("}")
+    return "\n".join(lines)

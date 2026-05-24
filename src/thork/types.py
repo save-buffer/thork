@@ -61,6 +61,20 @@ class DevicePointerSpec:
 
 
 @dataclass(frozen=True)
+class KittensGlobalSpec:
+    """
+    A parameter spec for a ThunderKittens 2-D global layout.
+
+    Lowers to a ``const __grid_constant__ kittens::gl<T, 1, 1, -1, -1[, ST]>``
+    kernel parameter. ``tile_shape`` (when set) controls the TMA tile type
+    bundled into the ``gl<>`` — required for ``tma::load_async`` / etc.
+    """
+
+    dtype      : dt.Dtype
+    tile_shape : Optional[tuple] = None
+
+
+@dataclass(frozen=True)
 class ScalarParamSpec:
     """
     A scalar (or vector) parameter spec.
@@ -100,6 +114,54 @@ class _DevicePointer:
 
 
 DevicePointer = _DevicePointer
+
+
+class _KittensGlobal:
+    """
+    Annotation marker for a ThunderKittens 2-D global tensor parameter.
+
+    Without a tile shape::
+
+        A : tk.kittens.Global[tk.dt.bfloat16]
+
+    With a TMA tile shape (required by ``tma::load_async`` etc.)::
+
+        A : tk.kittens.Global[tk.dt.bfloat16, (TILE_M, TILE_K)]
+    """
+
+    def __class_getitem__(cls, args) -> KittensGlobalSpec:
+        if isinstance(args, tuple):
+            if len(args) < 1:
+                raise TypeError("kittens.Global[...] requires at least a dtype")
+            dtype = args[0]
+            extras = args[1:]
+        else:
+            dtype = args
+            extras = ()
+        if not isinstance(dtype, dt.Dtype):
+            raise TypeError(
+                f"kittens.Global[...] expects a thork dtype as the first "
+                f"argument, got {dtype!r}"
+            )
+        tile_shape : Optional[tuple] = None
+        if extras:
+            if len(extras) != 1:
+                raise TypeError(
+                    "kittens.Global[dtype, (R, C)] accepts at most one tile "
+                    f"shape; got {len(extras)} extras"
+                )
+            shape = extras[0]
+            if not (isinstance(shape, tuple) and len(shape) == 2
+                    and all(isinstance(x, int) and x > 0 for x in shape)):
+                raise TypeError(
+                    "kittens.Global tile shape must be a (rows, cols) tuple "
+                    f"of positive ints, got {shape!r}"
+                )
+            tile_shape = shape
+        return KittensGlobalSpec(dtype=dtype, tile_shape=tile_shape)
+
+
+KittensGlobal = _KittensGlobal
 
 
 def _scalar_factory(dtype : dt.Dtype, cuda_name : str, vec_size : int = 1):

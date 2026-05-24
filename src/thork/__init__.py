@@ -1,5 +1,6 @@
 from . import dtypes as dt
 from . import kernels
+from . import kittens
 from .jit import BoundKernel, JittedKernel, jit
 from .tracer import (
     DeviceFn,
@@ -94,6 +95,7 @@ from .types import (
 __all__ = [
     "dt",
     "kernels",
+    "kittens",
     "jit",
     "JittedKernel",
     "BoundKernel",

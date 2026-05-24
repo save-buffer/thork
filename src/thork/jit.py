@@ -6,12 +6,13 @@ from . import runtime
 from . import tracer as _tracer
 from .codegen import emit_kernel
 from .tracer import KernelBuilder, PointerTracer, Tracer, VectorTracer
-from .types import DevicePointerSpec, ScalarParamSpec, _ScalarTypeBase
+from .types import DevicePointerSpec, KittensGlobalSpec, ScalarParamSpec, _ScalarTypeBase
 
 
 def _annotation_to_spec(ann, kernel_name : str, param_name : str):
     """
-    Normalize a parameter annotation into a DevicePointerSpec or ScalarParamSpec.
+    Normalize a parameter annotation into a DevicePointerSpec, ScalarParamSpec
+    or KittensGlobalSpec.
 
     A bare scalar class (e.g. ``tk.Uint``) becomes a by-value constant
     ScalarParamSpec. A subscripted form (e.g. ``tk.Uint3[BlockIdx]``) is
@@ -20,6 +21,8 @@ def _annotation_to_spec(ann, kernel_name : str, param_name : str):
     if isinstance(ann, DevicePointerSpec):
         return ann
     if isinstance(ann, ScalarParamSpec):
+        return ann
+    if isinstance(ann, KittensGlobalSpec):
         return ann
     if inspect.isclass(ann) and issubclass(ann, _ScalarTypeBase):
         return ScalarParamSpec(
@@ -30,7 +33,8 @@ def _annotation_to_spec(ann, kernel_name : str, param_name : str):
         )
     raise TypeError(
         f"Kernel '{kernel_name}': parameter '{param_name}' has unsupported "
-        f"annotation {ann!r}. Expected tk.DevicePointer[...] or tk.Uint[...] etc."
+        f"annotation {ann!r}. Expected tk.DevicePointer[...], tk.Uint[...] "
+        "or tk.kittens.Global[...]."
     )
 
 
@@ -73,6 +77,18 @@ class JittedKernel:
                     dtype=spec.dtype,
                 ))
                 tracer_args.append(PointerTracer(ir.Var(param_name), spec.dtype, builder))
+            elif isinstance(spec, KittensGlobalSpec):
+                from .kittens import KittensGlobalTracer, _mark_kittens
+                builder.params.append(ir.Param(
+                    name=param_name,
+                    kind="kittens_global",
+                    dtype=spec.dtype,
+                    tile_shape=spec.tile_shape,
+                ))
+                _mark_kittens(builder)
+                tracer_args.append(KittensGlobalTracer(
+                    ir.Var(param_name), spec.dtype, builder,
+                ))
             else:
                 kind = "attribute" if spec.attribute is not None else "constant"
                 builder.params.append(ir.Param(
@@ -99,12 +115,22 @@ class JittedKernel:
         return builder
 
     def _ensure_compiled(self):
-        if self._func is not None:
+        if self._func is not None or self._module is not None:
             return
         self._builder = self._trace()
         self._source, self._source_map = emit_kernel(self._builder)
-        self._module = runtime.compile_source(self._source, source_map=self._source_map)
-        self._func = runtime.get_function(self._module, self.name)
+        if self._builder.uses_kittens:
+            self._module = runtime.compile_source_to_shared_lib(
+                self._source,
+                source_map=self._source_map,
+                include_dirs=runtime.kittens_include_dirs(),
+                defines=[runtime.kittens_sm_define()],
+            )
+        else:
+            self._module = runtime.compile_source(
+                self._source, source_map=self._source_map,
+            )
+            self._func = runtime.get_function(self._module, self.name)
 
     def __getitem__(self, dispatch_spec) -> "_Launcher":
         if not (isinstance(dispatch_spec, tuple) and len(dispatch_spec) == 2):
@@ -122,6 +148,30 @@ class JittedKernel:
         ``kernel[grid, block](*args)`` boilerplate at each call site.
         """
         return BoundKernel(self, grid, block)
+
+    def compile_for_arch(self, arch : str) -> None:
+        """
+        Trace + compile this kernel for a target SM (e.g. ``"100"`` for
+        B100/B200) without launching. Useful when the kernel uses features
+        unsupported by the host GPU (e.g. tcgen05 on an SM_120 dev box).
+        Raises on compile failure.
+        """
+        builder = self._trace()
+        source, smap = emit_kernel(builder)
+        if builder.uses_kittens:
+            runtime.compile_source_to_shared_lib(
+                source,
+                source_map=smap,
+                include_dirs=runtime.kittens_include_dirs(),
+                defines=[runtime.kittens_sm_define_for_cap(arch)],
+                arch=arch,
+                load=False,
+            )
+        else:
+            raise NotImplementedError(
+                "compile_for_arch is currently only supported for "
+                "ThunderKittens-using kernels"
+            )
 
     @property
     def cuda_source(self) -> str:
@@ -151,13 +201,25 @@ class _Launcher:
 
     def __call__(self, *args):
         self._kernel._ensure_compiled()
-        runtime.dispatch(
-            self._kernel._func,
-            self._kernel._builder.params,
-            args,
-            self._grid_size,
-            self._block_size,
-        )
+        builder = self._kernel._builder
+        if builder.uses_kittens:
+            runtime.dispatch_tk(
+                self._kernel._module,
+                self._kernel.name,
+                builder.params,
+                args,
+                self._grid_size,
+                self._block_size,
+                shared_mem_bytes=runtime.max_dynamic_shared_size(),
+            )
+        else:
+            runtime.dispatch(
+                self._kernel._func,
+                builder.params,
+                args,
+                self._grid_size,
+                self._block_size,
+            )
 
 
 def jit(fn : Callable) -> JittedKernel:

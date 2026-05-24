@@ -239,3 +239,4 @@ class Param:
     vec_size   : int = 1
     attribute  : Optional[Type[ThreadAttribute]] = None
     written    : bool = False
+    tile_shape : Optional[tuple] = None
