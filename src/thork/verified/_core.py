@@ -436,26 +436,54 @@ def _hook_unary(operand, op : str):
     return None
 
 
-_MATH_FUNCS = {
-    "expf"   : st.exp,
-    "sinf"   : st.sin,
-    "cosf"   : st.cos,
-    "sqrtf"  : st.sqrt,
-    "__expf" : st.exp,
-    "__sinf" : st.sin,
-    "__cosf" : st.cos,
+_UNARY_MATH = {
+    "expf"        : st.exp,
+    "__expf"      : st.exp,
+    "sinf"        : st.sin,
+    "__sinf"      : st.sin,
+    "cosf"        : st.cos,
+    "__cosf"      : st.cos,
+    "sqrtf"       : st.sqrt,
+    "__fsqrt_rn"  : st.sqrt,
+    "fabsf"       : st.abs,
+    "abs"         : st.abs,
+}
+
+
+_BINARY_MATH = {
+    "fminf" : st.minimum,
+    "fmaxf" : st.maximum,
+    "min"   : st.minimum,
+    "max"   : st.maximum,
 }
 
 
 def _hook_math(func : str, args):
-    if func not in _MATH_FUNCS:
-        return None
-    if len(args) != 1:
-        return None
-    operand_st = _stype_of(args[0])
-    if operand_st is None:
-        return None
-    return _MATH_FUNCS[func](operand_st)
+    if func in _UNARY_MATH:
+        if len(args) != 1:
+            return None
+        operand_st = _stype_of(args[0])
+        if operand_st is None:
+            return None
+        return _UNARY_MATH[func](operand_st)
+    if func in _BINARY_MATH:
+        if len(args) != 2:
+            return None
+        a_st = _stype_of(args[0])
+        b_st = _stype_of(args[1])
+        if a_st is None and b_st is None:
+            return None
+        if a_st is None:
+            a_st = _scalar_stype_value(_unwrap_scalar(args[0]))
+        if b_st is None:
+            b_st = _scalar_stype_value(_unwrap_scalar(args[1]))
+        if a_st is None or b_st is None:
+            return None
+        try:
+            return _BINARY_MATH[func](a_st, b_st)
+        except ValueError:
+            return None
+    return None
 
 
 def _hook_scalar(value):

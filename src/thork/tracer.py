@@ -893,7 +893,8 @@ def cast(value, dtype : dt.Dtype) -> Tracer:
     """
     Emit ``static_cast<dtype>(value)``.
     """
-    return Tracer(ir.Cast(dtype, _to_expr(value)), dtype)
+    src_stype = value._stype if isinstance(value, Tracer) else _scalar_stype(value)
+    return Tracer(ir.Cast(dtype, _to_expr(value)), dtype, stype=src_stype)
 
 
 # ---------------------------------------------------------------------------

@@ -387,6 +387,87 @@ def test_matmul_rejects_wrong_accumulator():
         matmul_bad[(Nw.size, Mw.size, 1), (1, 1, 1)](out, A.ravel(), B.ravel())
 
 
+def test_abs_intrinsic():
+    """
+    ``tk.abs`` flows through the verifier as ``stile.abs`` (which
+    lowers to ``max(x, -x)``).
+    """
+    N = dim("AbsN", 128)
+    block = 32
+
+    @tvk.jit(spec="abs(X:AbsN)")
+    def kabs(
+        out : tvk.Tensor[tk.dt.float32, "AbsN"],
+        X   : tvk.Tensor[tk.dt.float32, "X:AbsN"],
+        bid : tk.Uint[tk.BlockIdx],
+        tid : tk.Uint[tk.ThreadIdx],
+        bdm : tk.Uint[tk.BlockDim],
+    ):
+        i = bid * bdm + tid
+        x = tvk.load(X, N[i:i + 1])
+        tvk.store(out, tk.abs(x), N[i:i + 1])
+
+    X = np.random.randn(N.size).astype(np.float32) * 2.0
+    out = np.zeros(N.size, dtype=np.float32)
+    kabs[(N.size // block, 1, 1), (block, 1, 1)](out, X)
+    np.testing.assert_allclose(out, np.abs(X), rtol=1e-5, atol=1e-5)
+
+
+def test_max_intrinsic_relu_style():
+    """
+    ``tk.max(x, 0)`` types as ``maximum(X, 0)`` — the natural
+    relu-via-max form.
+    """
+    N = dim("MaxN", 128)
+    block = 32
+
+    @tvk.jit(spec="relu(X:MaxN)")
+    def krelu(
+        out : tvk.Tensor[tk.dt.float32, "MaxN"],
+        X   : tvk.Tensor[tk.dt.float32, "X:MaxN"],
+        bid : tk.Uint[tk.BlockIdx],
+        tid : tk.Uint[tk.ThreadIdx],
+        bdm : tk.Uint[tk.BlockDim],
+    ):
+        i = bid * bdm + tid
+        x = tvk.load(X, N[i:i + 1])
+        tvk.store(out, tk.max(x, 0.0), N[i:i + 1])
+
+    X = np.random.randn(N.size).astype(np.float32)
+    out = np.zeros(N.size, dtype=np.float32)
+    krelu[(N.size // block, 1, 1), (block, 1, 1)](out, X)
+    np.testing.assert_allclose(out, np.maximum(X, 0.0), rtol=1e-5, atol=1e-5)
+
+
+def test_cast_preserves_stype():
+    """
+    ``tk.cast`` changes the dtype but not the logical stile expression,
+    so verification still succeeds.
+    """
+    N = dim("CN", 128)
+    block = 32
+
+    @tvk.jit(spec="2 * X:CN")
+    def kcast(
+        out : tvk.Tensor[tk.dt.float32, "CN"],
+        X   : tvk.Tensor[tk.dt.float32, "X:CN"],
+        bid : tk.Uint[tk.BlockIdx],
+        tid : tk.Uint[tk.ThreadIdx],
+        bdm : tk.Uint[tk.BlockDim],
+    ):
+        i = bid * bdm + tid
+        x = tvk.load(X, N[i:i + 1])
+        # Round-trip through float -> float keeps the stype intact;
+        # exercises the cast.stype-passthrough path.
+        x_cast = tk.cast(x * 2, tk.dt.float32)
+        tvk.store(out, x_cast, N[i:i + 1])
+
+    X = np.random.randn(N.size).astype(np.float32)
+    out = np.zeros(N.size, dtype=np.float32)
+    kcast[(N.size // block, 1, 1), (block, 1, 1)](out, X)
+    np.testing.assert_allclose(out, X * 2, rtol=1e-5, atol=1e-5)
+
+
 def test_plain_devicepointer_rejected():
     """
     A pointer parameter annotated with the plain ``tk.DevicePointer``
