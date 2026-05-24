@@ -2,7 +2,7 @@ import contextvars
 import inspect
 import os
 import sys
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import dtypes as dt
 from . import ir
@@ -138,6 +138,62 @@ def _to_expr(value) -> ir.Expr:
     )
 
 
+_stype_hooks : Dict[str, Callable] = {}
+
+
+def register_stype_hooks(**hooks) -> None:
+    """
+    Plug-in registration point used by ``thork.verified`` to supply
+    type-combination logic for binops / unary / math / scalar promotion
+    / local init. Keeps thork's tracer free of any stile import — when
+    no hooks are registered, ``_stype`` flow is a no-op.
+
+    Recognized keys: ``binop``, ``unary``, ``math``, ``scalar``,
+    ``local_init``.
+    """
+    _stype_hooks.update(hooks)
+
+
+def _combine_binop_stype(lhs, rhs, op : str, *, swap : bool = False):
+    """
+    Combine the ``_stype`` of two binop operands using the registered
+    hook, if any. Returns ``None`` when no hook is registered or
+    neither side has a stype.
+    """
+    fn = _stype_hooks.get("binop")
+    if fn is None:
+        return None
+    return fn(lhs, rhs, op, swap)
+
+
+def _combine_unary_stype(operand, op : str):
+    fn = _stype_hooks.get("unary")
+    if fn is None:
+        return None
+    return fn(operand, op)
+
+
+def _combine_math_stype(func : str, args):
+    fn = _stype_hooks.get("math")
+    if fn is None:
+        return None
+    return fn(func, args)
+
+
+def _scalar_stype(value):
+    fn = _stype_hooks.get("scalar")
+    if fn is None:
+        return None
+    return fn(value)
+
+
+def _local_init_stype(init):
+    fn = _stype_hooks.get("local_init")
+    if fn is None:
+        return None
+    return fn(init)
+
+
 def _result_dtype(a : "Tracer", other) -> Optional[dt.Dtype]:
     if isinstance(other, Tracer):
         if a._dtype is not None and other._dtype is not None:
@@ -151,13 +207,25 @@ def _result_dtype(a : "Tracer", other) -> Optional[dt.Dtype]:
 class Tracer:
     """
     Represents a scalar value in a traced kernel.
+
+    Carries an optional ``_stype`` (a stile ``Type``) so verification
+    layers like ``thork.verified`` can ride along on the same trace
+    that produces IR. The base ``thork`` package never imports stile —
+    a hook installed via ``_register_stype_combiner`` supplies the
+    combination logic when verification is active.
     """
 
-    __slots__ = ("_expr", "_dtype")
+    __slots__ = ("_expr", "_dtype", "_stype")
 
-    def __init__(self, expr : ir.Expr, dtype : Optional[dt.Dtype]):
+    def __init__(
+        self,
+        expr  : ir.Expr,
+        dtype : Optional[dt.Dtype],
+        stype : Any = None,
+    ):
         self._expr = expr
         self._dtype = dtype
+        self._stype = stype
 
     def _binop(self, op : str, other, *, swap : bool = False) -> "Tracer":
         rhs = _to_expr(other)
@@ -165,7 +233,8 @@ class Tracer:
             expr = ir.BinOp(op, rhs, self._expr)
         else:
             expr = ir.BinOp(op, self._expr, rhs)
-        return Tracer(expr, _result_dtype(self, other))
+        new_stype = _combine_binop_stype(self, other, op, swap=swap)
+        return Tracer(expr, _result_dtype(self, other), stype=new_stype)
 
     def _cmp(self, op : str, other) -> "Tracer":
         rhs = _to_expr(other)
@@ -199,9 +268,19 @@ class Tracer:
     def __eq__(self, other): return self._cmp("==", other)
     def __ne__(self, other): return self._cmp("!=", other)
 
-    def __neg__(self):    return Tracer(ir.UnaryOp("-", self._expr), self._dtype)
+    def __neg__(self):
+        return Tracer(
+            ir.UnaryOp("-", self._expr), self._dtype,
+            stype=_combine_unary_stype(self, "-"),
+        )
+
     def __pos__(self):    return self
-    def __invert__(self): return Tracer(ir.UnaryOp("~", self._expr), self._dtype)
+
+    def __invert__(self):
+        return Tracer(
+            ir.UnaryOp("~", self._expr), self._dtype,
+            stype=_combine_unary_stype(self, "~"),
+        )
 
     def __bool__(self):
         raise TypeError(
@@ -282,8 +361,34 @@ class Local(Tracer):
         self._builder = builder
         self._name = name
 
+    _BINOP_FROM_AUG = {
+        "+=" : "+",
+        "-=" : "-",
+        "*=" : "*",
+        "/=" : "/",
+        "%=" : "%",
+        "&=" : "&",
+        "|=" : "|",
+        "^=" : "^",
+        "<<=" : "<<",
+        ">>=" : ">>",
+    }
+
     def _update(self, op : str, value) -> "Local":
         self._builder.add_stmt(ir.Update(self._name, op, _to_expr(value)))
+        # Propagate stile types onto the Local. "=" replaces; compound
+        # ops combine the current stype with the rhs.
+        if op == "=":
+            if isinstance(value, Tracer):
+                self._stype = value._stype
+            else:
+                self._stype = _scalar_stype(value)
+        else:
+            bop = self._BINOP_FROM_AUG.get(op)
+            if bop is not None:
+                self._stype = _combine_binop_stype(
+                    self, value, bop, swap=False,
+                )
         return self
 
     def __iadd__(self, other):      return self._update("+=", other)
@@ -302,7 +407,7 @@ class Local(Tracer):
         """
         Assign a new value to this local: ``self = value;``.
         """
-        self._builder.add_stmt(ir.Update(self._name, "=", _to_expr(value)))
+        self._update("=", value)
 
 
 def local(dtype : dt.Dtype, init) -> Local:
@@ -316,7 +421,9 @@ def local(dtype : dt.Dtype, init) -> Local:
     name = builder.fresh_name("v")
     init_expr = _to_expr(init)
     builder.add_stmt(ir.Assign(name, dtype.cuda, init_expr))
-    return Local(name, dtype, builder)
+    loc = Local(name, dtype, builder)
+    loc._stype = _local_init_stype(init)
+    return loc
 
 
 def range(*args):
@@ -730,7 +837,10 @@ def _math_call(func : str, *args, result_dtype : Optional[dt.Dtype] = None) -> T
     if result_dtype is None:
         first = args[0]
         result_dtype = first._dtype if isinstance(first, Tracer) else None
-    return Tracer(ir.Call(func, arg_exprs), result_dtype)
+    return Tracer(
+        ir.Call(func, arg_exprs), result_dtype,
+        stype=_combine_math_stype(func, args),
+    )
 
 
 def exp(x)   : return _math_call("expf", x)
