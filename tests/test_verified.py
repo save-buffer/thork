@@ -468,6 +468,304 @@ def test_cast_preserves_stype():
     np.testing.assert_allclose(out, X * 2, rtol=1e-5, atol=1e-5)
 
 
+def _f32_to_bf16_u16(x : np.ndarray) -> np.ndarray:
+    u32 = x.view(np.uint32)
+    rounding_bias = ((u32 >> 16) & 1) + 0x7FFF
+    return ((u32 + rounding_bias) >> 16).astype(np.uint16)
+
+
+def _bf16_u16_to_f32(u16 : np.ndarray) -> np.ndarray:
+    return ((u16.astype(np.uint32) << 16)).view(np.float32)
+
+
+def test_verified_kittens_matmul():
+    """
+    Single-tile ThunderKittens matmul (M = N = K = BLOCK so the K-loop
+    runs once and the per-iteration K-slice equals the full K dim).
+    Verified against the einsum spec ``(A:M K, B:K N -> M N)``.
+    """
+    BLOCK = 32
+    M = dim("Mk", 32)
+    N = dim("Nk", 32)
+    K = dim("Kk", 32)
+
+    @tvk.jit(spec="(A:Mk Kk, B:Kk Nk -> Mk Nk)")
+    def matmul(
+        C   : tvk.kittens.Global[tk.dt.bfloat16, "Mk Nk"],
+        A   : tvk.kittens.Global[tk.dt.bfloat16, "A:Mk Kk"],
+        B   : tvk.kittens.Global[tk.dt.bfloat16, "B:Kk Nk"],
+        bid : tk.Uint2[tk.BlockIdx],
+    ):
+        row = bid.y
+        col = bid.x
+
+        As = tk.kittens.st_bf(BLOCK, BLOCK)
+        Bs = tk.kittens.st_bf(BLOCK, BLOCK)
+
+        A_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg_col = tk.kittens.rt_bf_col(BLOCK, BLOCK)
+        C_accum   = tk.kittens.rt_fl(BLOCK, BLOCK)
+
+        tk.kittens.zero(C_accum)
+        # Single-tile matmul: skip the K-loop entirely (M=N=K=BLOCK so
+        # there's only one tile). Hardcode the K-tile coord to 0 to
+        # avoid the symbolic-loop slice-folding question.
+        tk.kittens.load(As, A, (row, 0))
+        tk.kittens.load(Bs, B, (0, col))
+        tk.syncthreads()
+        tk.kittens.load(A_reg, As)
+        tk.kittens.load(B_reg, Bs)
+        tk.kittens.swap_layout(B_reg_col, B_reg)
+        tk.syncthreads()
+        tk.kittens.mma_AB(C_accum, A_reg, B_reg_col, C_accum)
+        tk.syncthreads()
+
+        tk.kittens.store(C, C_accum, (row, col))
+
+    rng = np.random.default_rng(0)
+    A_f32 = rng.standard_normal((M.size, K.size)).astype(np.float32) * 0.1
+    B_f32 = rng.standard_normal((K.size, N.size)).astype(np.float32) * 0.1
+    expected = A_f32 @ B_f32
+
+    A_bf = _f32_to_bf16_u16(A_f32)
+    B_bf = _f32_to_bf16_u16(B_f32)
+    C_bf = np.zeros((M.size, N.size), dtype=np.uint16)
+
+    matmul[
+        (N.size // BLOCK, M.size // BLOCK, 1),
+        (32, 1, 1),
+    ](C_bf, A_bf, B_bf)
+
+    C_f32 = _bf16_u16_to_f32(C_bf)
+    np.testing.assert_allclose(C_f32, expected, atol=2e-1, rtol=2e-2)
+
+
+def test_verified_kittens_matmul_multitile():
+    """
+    Multi-tile TK matmul. The K-loop iterates ``K.size // BLOCK`` tiles;
+    ``tvk.tile_range(K, BLOCK)`` opens a stile ``LoopScope`` and at
+    loop exit wraps the accumulator with ``ParametricReduce`` so the
+    adjacent K-tile reductions collapse into a single full-K reduction
+    that matches the einsum spec.
+    """
+    BLOCK = 32
+    M = dim("Mm", 64)
+    N = dim("Nm", 64)
+    K = dim("Km", 64)
+
+    @tvk.jit(spec="(A:Mm Km, B:Km Nm -> Mm Nm)")
+    def matmul(
+        C   : tvk.kittens.Global[tk.dt.bfloat16, "Mm Nm"],
+        A   : tvk.kittens.Global[tk.dt.bfloat16, "A:Mm Km"],
+        B   : tvk.kittens.Global[tk.dt.bfloat16, "B:Km Nm"],
+        bid : tk.Uint2[tk.BlockIdx],
+    ):
+        row = bid.y
+        col = bid.x
+
+        As = tk.kittens.st_bf(BLOCK, BLOCK)
+        Bs = tk.kittens.st_bf(BLOCK, BLOCK)
+        A_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg_col = tk.kittens.rt_bf_col(BLOCK, BLOCK)
+        C_accum   = tk.kittens.rt_fl(BLOCK, BLOCK)
+
+        tk.kittens.zero(C_accum)
+        for t in tvk.tile_range(K, BLOCK):
+            tk.kittens.load(As, A, (row, t))
+            tk.kittens.load(Bs, B, (t, col))
+            tk.syncthreads()
+            tk.kittens.load(A_reg, As)
+            tk.kittens.load(B_reg, Bs)
+            tk.kittens.swap_layout(B_reg_col, B_reg)
+            tk.syncthreads()
+            tk.kittens.mma_AB(C_accum, A_reg, B_reg_col, C_accum)
+            tk.syncthreads()
+
+        tk.kittens.store(C, C_accum, (row, col))
+
+    rng = np.random.default_rng(0)
+    A_f32 = rng.standard_normal((M.size, K.size)).astype(np.float32) * 0.1
+    B_f32 = rng.standard_normal((K.size, N.size)).astype(np.float32) * 0.1
+    expected = A_f32 @ B_f32
+
+    A_bf = _f32_to_bf16_u16(A_f32)
+    B_bf = _f32_to_bf16_u16(B_f32)
+    C_bf = np.zeros((M.size, N.size), dtype=np.uint16)
+
+    matmul[
+        (N.size // BLOCK, M.size // BLOCK, 1),
+        (32, 1, 1),
+    ](C_bf, A_bf, B_bf)
+
+    C_f32 = _bf16_u16_to_f32(C_bf)
+    np.testing.assert_allclose(C_f32, expected, atol=2e-1, rtol=2e-2)
+
+
+def test_coverage_rejects_partial_write():
+    """
+    A TK matmul that stores the output but uses ``(row, 0)`` instead of
+    ``(row, col)`` — so every block writes the same column tile of the
+    output. The verifier should accept the per-tile equivalence
+    (because each individual tile DOES equal the spec restricted to
+    its slice) but the coverage tracker should catch that the union
+    of stores doesn't cover the full N axis.
+    """
+    BLOCK = 32
+    M = dim("Mc", 64)
+    N = dim("Nc", 64)
+    K = dim("Kc", 32)
+
+    @tvk.jit(spec="(A:Mc Kc, B:Kc Nc -> Mc Nc)")
+    def matmul_partial(
+        C   : tvk.kittens.Global[tk.dt.bfloat16, "Mc Nc"],
+        A   : tvk.kittens.Global[tk.dt.bfloat16, "A:Mc Kc"],
+        B   : tvk.kittens.Global[tk.dt.bfloat16, "B:Kc Nc"],
+        bid : tk.Uint2[tk.BlockIdx],
+    ):
+        row = bid.y
+        col = bid.x
+
+        As = tk.kittens.st_bf(BLOCK, BLOCK)
+        Bs = tk.kittens.st_bf(BLOCK, BLOCK)
+        A_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg_col = tk.kittens.rt_bf_col(BLOCK, BLOCK)
+        C_accum   = tk.kittens.rt_fl(BLOCK, BLOCK)
+
+        tk.kittens.zero(C_accum)
+        tk.kittens.load(As, A, (row, 0))
+        tk.kittens.load(Bs, B, (0, col))
+        tk.syncthreads()
+        tk.kittens.load(A_reg, As)
+        tk.kittens.load(B_reg, Bs)
+        tk.kittens.swap_layout(B_reg_col, B_reg)
+        tk.syncthreads()
+        tk.kittens.mma_AB(C_accum, A_reg, B_reg_col, C_accum)
+        tk.syncthreads()
+
+        # Bug: always store to col 0, ignoring bid.x. Per-tile verification
+        # still passes (each store DOES equal the spec at (row, 0)) but
+        # the union of stores covers only N[0:32], not N[0:64].
+        tk.kittens.store(C, C_accum, (row, 0))
+
+    A = np.zeros((M.size, K.size), dtype=np.uint16)
+    B = np.zeros((K.size, N.size), dtype=np.uint16)
+    C = np.zeros((M.size, N.size), dtype=np.uint16)
+    with pytest.raises(ValueError, match="coverage check failed"):
+        matmul_partial[
+            (N.size // BLOCK, M.size // BLOCK, 1), (32, 1, 1),
+        ](C, A, B)
+
+
+def test_coverage_accepts_full_matmul():
+    """
+    The full multi-tile matmul covers M × N — coverage check passes.
+    (Sanity test that the tracker doesn't false-positive.)
+    """
+    BLOCK = 32
+    M = dim("Mcv", 64)
+    N = dim("Ncv", 64)
+    K = dim("Kcv", 64)
+
+    @tvk.jit(spec="(A:Mcv Kcv, B:Kcv Ncv -> Mcv Ncv)")
+    def matmul(
+        C   : tvk.kittens.Global[tk.dt.bfloat16, "Mcv Ncv"],
+        A   : tvk.kittens.Global[tk.dt.bfloat16, "A:Mcv Kcv"],
+        B   : tvk.kittens.Global[tk.dt.bfloat16, "B:Kcv Ncv"],
+        bid : tk.Uint2[tk.BlockIdx],
+    ):
+        row = bid.y
+        col = bid.x
+        As = tk.kittens.st_bf(BLOCK, BLOCK)
+        Bs = tk.kittens.st_bf(BLOCK, BLOCK)
+        A_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg     = tk.kittens.rt_bf(BLOCK, BLOCK)
+        B_reg_col = tk.kittens.rt_bf_col(BLOCK, BLOCK)
+        C_accum   = tk.kittens.rt_fl(BLOCK, BLOCK)
+        tk.kittens.zero(C_accum)
+        for t in tvk.tile_range(K, BLOCK):
+            tk.kittens.load(As, A, (row, t))
+            tk.kittens.load(Bs, B, (t, col))
+            tk.syncthreads()
+            tk.kittens.load(A_reg, As)
+            tk.kittens.load(B_reg, Bs)
+            tk.kittens.swap_layout(B_reg_col, B_reg)
+            tk.syncthreads()
+            tk.kittens.mma_AB(C_accum, A_reg, B_reg_col, C_accum)
+            tk.syncthreads()
+        tk.kittens.store(C, C_accum, (row, col))
+
+    rng = np.random.default_rng(0)
+    A_f32 = rng.standard_normal((M.size, K.size)).astype(np.float32) * 0.1
+    B_f32 = rng.standard_normal((K.size, N.size)).astype(np.float32) * 0.1
+    A_bf = _f32_to_bf16_u16(A_f32)
+    B_bf = _f32_to_bf16_u16(B_f32)
+    C_bf = np.zeros((M.size, N.size), dtype=np.uint16)
+    matmul[
+        (N.size // BLOCK, M.size // BLOCK, 1), (32, 1, 1),
+    ](C_bf, A_bf, B_bf)
+    C_f32 = _bf16_u16_to_f32(C_bf)
+    np.testing.assert_allclose(C_f32, A_f32 @ B_f32, atol=2e-1, rtol=2e-2)
+
+
+def test_coverage_elementwise_accepts_full():
+    """
+    Elementwise kernel where each thread writes ``out[bid*bdm + tid]``.
+    The unfolder recognizes ``BlockIdx * BlockDim + ThreadIdx``, the
+    coverage check enumerates over both grid and block axes (with
+    BlockDim substituted by its constant), and the union covers N.
+    """
+    N = dim("EwN", 256)
+    block = 32
+
+    @tvk.jit(spec="2 * X:EwN")
+    def kernel(
+        out : tvk.Tensor[tk.dt.float32, "EwN"],
+        X   : tvk.Tensor[tk.dt.float32, "X:EwN"],
+        bid : tk.Uint[tk.BlockIdx],
+        tid : tk.Uint[tk.ThreadIdx],
+        bdm : tk.Uint[tk.BlockDim],
+    ):
+        i = bid * bdm + tid
+        x = tvk.load(X, N[i:i + 1])
+        tvk.store(out, x * 2, N[i:i + 1])
+
+    X = np.random.randn(N.size).astype(np.float32)
+    out = np.zeros(N.size, dtype=np.float32)
+    kernel[(N.size // block, 1, 1), (block, 1, 1)](out, X)
+    np.testing.assert_allclose(out, X * 2)
+
+
+def test_coverage_elementwise_rejects_half_grid():
+    """
+    An elementwise kernel run with only HALF the grid that the spec
+    requires. Coverage should catch that the union only covers the
+    first half of N.
+    """
+    N = dim("EhN", 256)
+    block = 32
+
+    @tvk.jit(spec="2 * X:EhN")
+    def kernel(
+        out : tvk.Tensor[tk.dt.float32, "EhN"],
+        X   : tvk.Tensor[tk.dt.float32, "X:EhN"],
+        bid : tk.Uint[tk.BlockIdx],
+        tid : tk.Uint[tk.ThreadIdx],
+        bdm : tk.Uint[tk.BlockDim],
+    ):
+        i = bid * bdm + tid
+        x = tvk.load(X, N[i:i + 1])
+        tvk.store(out, x * 2, N[i:i + 1])
+
+    X = np.zeros(N.size, dtype=np.float32)
+    out = np.zeros(N.size, dtype=np.float32)
+    # Half the grid — only writes elements [0, 128), leaves [128, 256) untouched.
+    with pytest.raises(ValueError, match="coverage check failed"):
+        kernel[((N.size // 2) // block, 1, 1), (block, 1, 1)](out, X)
+
+
 def test_plain_devicepointer_rejected():
     """
     A pointer parameter annotated with the plain ``tk.DevicePointer``

@@ -38,9 +38,11 @@ if _HAS_STILE:
         TypedThorkKernel,
         at,
         jit,
+        kittens,
         load,
         range,
         store,
+        tile_range,
     )
 
     __all__ = [
@@ -48,9 +50,11 @@ if _HAS_STILE:
         "TypedThorkKernel",
         "at",
         "jit",
+        "kittens",
         "load",
         "range",
         "store",
+        "tile_range",
     ]
 else:
     def __getattr__(name : str):

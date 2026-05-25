@@ -13,7 +13,7 @@ runtime routes them through ``nvcc`` (TK pulls in libstdc++ headers
 that nvrtc can't satisfy on its own).
 """
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from . import dtypes as dt
 from . import ir
@@ -71,6 +71,31 @@ _TK_ELEM = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Hook system for verification (used by thork.verified). No stile imports here.
+# ---------------------------------------------------------------------------
+
+
+_tk_stype_hooks : Dict[str, Any] = {}
+
+
+def register_tk_stype_hooks(**hooks) -> None:
+    """
+    Plug-in registration point for ``thork.verified`` to attach
+    type-propagation callbacks to TK ops. Keys: ``zero``, ``load``,
+    ``store``, ``swap_layout``, ``mma_AB``, ``mma_AB_t``,
+    ``global_tracer_init``.
+
+    When unset, the hooks are no-ops and TK ops behave exactly like the
+    non-verified path.
+    """
+    _tk_stype_hooks.update(hooks)
+
+
+def _tk_hook(name : str):
+    return _tk_stype_hooks.get(name)
+
+
 def _tk_elem(d : dt.Dtype) -> str:
     if d.name not in _TK_ELEM:
         raise TypeError(f"thork dtype {d.name} has no ThunderKittens equivalent")
@@ -82,14 +107,20 @@ class _TKHandle:
     Base class for handles to TK objects (register tiles, shared tiles,
     global descriptors). Subclasses set ``_expr`` to the IR ``Var`` that
     references the object by its emitted C++ name.
+
+    Carries an optional ``_stype`` so ``thork.verified`` can ride along
+    on the same trace that emits TK calls. Base thork.kittens never
+    imports stile — hooks installed via ``register_tk_stype_hooks``
+    populate ``_stype`` when verification is active.
     """
 
-    __slots__ = ("_expr", "_dtype", "_builder")
+    __slots__ = ("_expr", "_dtype", "_builder", "_stype")
 
     def __init__(self, expr : ir.Expr, dtype : dt.Dtype, builder : KernelBuilder):
         self._expr = expr
         self._dtype = dtype
         self._builder = builder
+        self._stype = None
 
 
 class KittensGlobalTracer(_TKHandle):
@@ -429,6 +460,9 @@ def _zero(scope : str, rt : RegisterTile) -> None:
     builder = current_builder()
     _mark_kittens(builder)
     builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::zero", [rt._expr])))
+    hook = _tk_hook("zero")
+    if hook is not None:
+        hook(rt)
 
 
 def _load(scope : str, dst, src, coord) -> None:
@@ -439,23 +473,24 @@ def _load(scope : str, dst, src, coord) -> None:
             raise TypeError("load(shared, global, coord) requires a coord tuple")
         args = [dst._expr, src._expr, _coord_expr(coord)]
         builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::load", args)))
-        return
-    if isinstance(dst, RegisterTile) and isinstance(src, SharedTile):
+    elif isinstance(dst, RegisterTile) and isinstance(src, SharedTile):
         if coord is not None:
             raise TypeError("load(register, shared) does not take a coord")
         args = [dst._expr, src._expr]
         builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::load", args)))
-        return
-    if isinstance(dst, RegisterTile) and isinstance(src, KittensGlobalTracer):
+    elif isinstance(dst, RegisterTile) and isinstance(src, KittensGlobalTracer):
         if coord is None:
             raise TypeError("load(register, global, coord) requires a coord tuple")
         args = [dst._expr, src._expr, _coord_expr(coord)]
         builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::load", args)))
-        return
-    raise TypeError(
-        f"kittens.load: unsupported argument combination "
-        f"({type(dst).__name__}, {type(src).__name__})"
-    )
+    else:
+        raise TypeError(
+            f"kittens.load: unsupported argument combination "
+            f"({type(dst).__name__}, {type(src).__name__})"
+        )
+    hook = _tk_hook("load")
+    if hook is not None:
+        hook(dst, src, coord)
 
 
 def _store(scope : str, dst, src, coord) -> None:
@@ -470,17 +505,19 @@ def _store(scope : str, dst, src, coord) -> None:
                 break
         args = [dst._expr, src._expr, _coord_expr(coord)]
         builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::store", args)))
-        return
-    if isinstance(dst, SharedTile) and isinstance(src, RegisterTile):
+    elif isinstance(dst, SharedTile) and isinstance(src, RegisterTile):
         if coord is not None:
             raise TypeError("store(shared, register) does not take a coord")
         args = [dst._expr, src._expr]
         builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::store", args)))
-        return
-    raise TypeError(
-        f"kittens.store: unsupported argument combination "
-        f"({type(dst).__name__}, {type(src).__name__})"
-    )
+    else:
+        raise TypeError(
+            f"kittens.store: unsupported argument combination "
+            f"({type(dst).__name__}, {type(src).__name__})"
+        )
+    hook = _tk_hook("store")
+    if hook is not None:
+        hook(dst, src, coord)
 
 
 def _swap_layout(scope : str, dst : RegisterTile, src : RegisterTile) -> None:
@@ -491,6 +528,9 @@ def _swap_layout(scope : str, dst : RegisterTile, src : RegisterTile) -> None:
     builder.add_stmt(ir.ExprStmt(ir.Call(
         f"kittens::{scope}::swap_layout", [dst._expr, src._expr],
     )))
+    hook = _tk_hook("swap_layout")
+    if hook is not None:
+        hook(dst, src)
 
 
 def _mma(
@@ -512,6 +552,9 @@ def _mma(
     _mark_kittens(builder)
     ir_args = [c._expr, a._expr, b._expr, c_in._expr]
     builder.add_stmt(ir.ExprStmt(ir.Call(f"kittens::{scope}::{func}", ir_args)))
+    hook = _tk_hook(func)
+    if hook is not None:
+        hook(c, a, b, c_in)
 
 
 def _wg_tcgen05_mma(func : str, d, a, b, sem) -> None:
